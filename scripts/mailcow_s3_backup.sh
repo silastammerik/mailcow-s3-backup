@@ -2,6 +2,20 @@
 
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+load_env_file() {
+  local env_file="${1:-}"
+
+  [[ -f "${env_file}" ]] || return 0
+
+  set -a
+  # shellcheck disable=SC1090
+  source "${env_file}"
+  set +a
+}
+
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
@@ -59,6 +73,11 @@ delete_old_local_backups() {
   log "Deleting local backup directories older than ${retention_days} days"
   find "${MAILCOW_BACKUP_LOCATION}" -mindepth 1 -maxdepth 1 -type d -name 'mailcow-*' -mtime +"${retention_days}" -print -exec rm -rf {} +
 }
+
+load_env_file "${PROJECT_ROOT}/.env"
+if [[ "${PWD}" != "${PROJECT_ROOT}" ]]; then
+  load_env_file "${PWD}/.env"
+fi
 
 MAILCOW_BACKUP_SCRIPT="${MAILCOW_BACKUP_SCRIPT:-/opt/mailcow-dockerized/helper-scripts/backup_and_restore.sh}"
 MAILCOW_BACKUP_LOCATION="${MAILCOW_BACKUP_LOCATION:-/var/backups/mailcow}"

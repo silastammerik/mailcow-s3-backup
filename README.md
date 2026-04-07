@@ -17,15 +17,13 @@ This project does not replace Mailcow's backup logic. It runs the official `back
 
 1. Copy `.env.example` to `.env`.
 2. Adjust the `rclone` and Mailcow paths.
-3. Load the environment and run:
+3. Run the script:
 
 ```bash
-set -a
-source .env
-set +a
-
 ./scripts/mailcow_s3_backup.sh
 ```
+
+The script automatically loads `.env` from the project root when present.
 
 ## Main Variables
 
