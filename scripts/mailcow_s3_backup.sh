@@ -64,6 +64,7 @@ MAILCOW_BACKUP_SCRIPT="${MAILCOW_BACKUP_SCRIPT:-/opt/mailcow-dockerized/helper-s
 MAILCOW_BACKUP_LOCATION="${MAILCOW_BACKUP_LOCATION:-/var/backups/mailcow}"
 MAILCOW_BACKUP_TARGET="${MAILCOW_BACKUP_TARGET:-all}"
 RCLONE_REMOTE="${RCLONE_REMOTE:-}"
+RCLONE_BUCKET="${RCLONE_BUCKET:-}"
 RCLONE_DESTINATION_PATH="${RCLONE_DESTINATION_PATH:-}"
 RCLONE_CONFIG_FILE="${RCLONE_CONFIG_FILE:-}"
 RCLONE_FLAGS="${RCLONE_FLAGS:-}"
@@ -76,6 +77,7 @@ require_bin rclone
 
 [[ -x "${MAILCOW_BACKUP_SCRIPT}" ]] || fail "MAILCOW_BACKUP_SCRIPT is not executable: ${MAILCOW_BACKUP_SCRIPT}"
 [[ -n "${RCLONE_REMOTE}" ]] || fail "RCLONE_REMOTE is required"
+[[ -n "${RCLONE_BUCKET}" ]] || fail "RCLONE_BUCKET is required"
 [[ "${MAILCOW_BACKUP_LOCATION}" = /* ]] || fail "MAILCOW_BACKUP_LOCATION must be an absolute path"
 [[ "${MAILCOW_BACKUP_TARGET}" =~ ^(crypt|vmail|redis|rspamd|postfix|mysql|all)$ ]] || fail "MAILCOW_BACKUP_TARGET has an invalid value"
 [[ "${THREADS}" =~ ^[1-9][0-9]*$ ]] || fail "THREADS must be a positive integer"
@@ -104,7 +106,8 @@ after_latest="$(
 
 backup_dir="${after_latest}"
 backup_name="$(basename "${backup_dir}")"
-remote_path="$(join_remote_path "${RCLONE_DESTINATION_PATH}" "${backup_name}")"
+remote_base_path="$(join_remote_path "${RCLONE_BUCKET}" "${RCLONE_DESTINATION_PATH}")"
+remote_path="$(join_remote_path "${remote_base_path}" "${backup_name}")"
 remote_target="${RCLONE_REMOTE}:${remote_path}"
 
 build_rclone_args
