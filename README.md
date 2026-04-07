@@ -47,6 +47,9 @@ The script automatically loads `.env` from the project root when present.
 ## Notes
 
 - The script uploads the full generated backup directory so all Mailcow backup artifacts stay grouped under one timestamp.
+- Mailcow creates the backup locally first in `MAILCOW_BACKUP_LOCATION`, then the script uploads it to S3.
+- To avoid consuming local disk space after a successful upload, set `DELETE_LOCAL_AFTER_UPLOAD=true` in `.env`.
+- When `DELETE_LOCAL_AFTER_UPLOAD=true`, a later `--restore` will download the selected backup from S3 again before starting the Mailcow restore flow.
 - Credentials and provider-specific settings are handled by the configured `rclone` remote; the destination bucket is selected via `RCLONE_BUCKET`.
 
 ## List Backups
@@ -76,7 +79,7 @@ Important:
 - Run restore from the actual Mailcow installation directory and use the original `helper-scripts/backup_and_restore.sh`.
 - The target Mailcow instance should already be installed, initialized, and running before restore.
 - The final `backup_and_restore.sh restore` step remains interactive, because that is Mailcow's native restore behavior.
-- If the local directory `${MAILCOW_BACKUP_LOCATION}/<backup-name>` already exists, the script aborts instead of overwriting it.
+- If the local directory `${MAILCOW_BACKUP_LOCATION}/<backup-name>` already exists, the script reuses it and skips the download step.
 - If `RCLONE_DESTINATION_PATH` is empty, omit that path segment from the `rclone` commands above.
 - For large restores, ensure `MAILCOW_BACKUP_LOCATION` has enough free disk space for the full extracted backup.
 

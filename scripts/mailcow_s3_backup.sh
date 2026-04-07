@@ -159,15 +159,19 @@ run_restore() {
   remote_target="$(build_remote_target "${restore_name}")"
   local_restore_dir="${MAILCOW_BACKUP_LOCATION}/${restore_name}"
 
-  if [[ -e "${local_restore_dir}" ]]; then
-    fail "Local restore directory already exists: ${local_restore_dir}"
+  if [[ -d "${local_restore_dir}" ]]; then
+    log "Using existing local restore directory ${local_restore_dir}"
+  else
+    if [[ -e "${local_restore_dir}" ]]; then
+      fail "Local restore path exists but is not a directory: ${local_restore_dir}"
+    fi
+
+    log "Downloading ${restore_name} from ${remote_target} to ${local_restore_dir}"
+    build_rclone_copy_args "${remote_target}" "${local_restore_dir}"
+    rclone "${RCLONE_ARGS[@]}"
+
+    [[ -d "${local_restore_dir}" ]] || fail "Restore download did not create ${local_restore_dir}"
   fi
-
-  log "Downloading ${restore_name} from ${remote_target} to ${local_restore_dir}"
-  build_rclone_copy_args "${remote_target}" "${local_restore_dir}"
-  rclone "${RCLONE_ARGS[@]}"
-
-  [[ -d "${local_restore_dir}" ]] || fail "Restore download did not create ${local_restore_dir}"
 
   log "Starting Mailcow restore using ${MAILCOW_BACKUP_SCRIPT}"
   MAILCOW_BACKUP_LOCATION="${MAILCOW_BACKUP_LOCATION}" THREADS="${THREADS}" \
