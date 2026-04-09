@@ -19,6 +19,7 @@ SOURCE_DBNAME=""
 FULL_RESTORE_STAGE_ROOT=""
 FULL_RESTORE_TEMP_DB_DIR=""
 FULL_RESTORE_TEMP_DB_CONTAINER=""
+DEBUG="${DEBUG:-false}"
 
 load_env_file() {
   local env_file="${1:-}"
@@ -56,6 +57,56 @@ trap cleanup_temp_resources EXIT
 
 require_bin() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required binary: $1"
+}
+
+run_quiet_command() {
+  local description="${1:?description is required}"
+  shift
+  local log_file
+
+  log "${description}"
+
+  if [[ "${DEBUG}" == "true" ]]; then
+    "$@"
+    return 0
+  fi
+
+  log_file="$(mktemp)"
+
+  if "$@" >"${log_file}" 2>&1; then
+    rm -f "${log_file}"
+    return 0
+  fi
+
+  cat "${log_file}" >&2
+  rm -f "${log_file}"
+  fail "${description} failed"
+}
+
+run_filtered_command() {
+  local description="${1:?description is required}"
+  local filter_pattern="${2:?filter_pattern is required}"
+  shift 2
+  local log_file
+
+  log "${description}"
+
+  if [[ "${DEBUG}" == "true" ]]; then
+    "$@"
+    return 0
+  fi
+
+  log_file="$(mktemp)"
+
+  if "$@" >"${log_file}" 2>&1; then
+    grep -Ev "${filter_pattern}" "${log_file}" || true
+    rm -f "${log_file}"
+    return 0
+  fi
+
+  cat "${log_file}" >&2
+  rm -f "${log_file}"
+  fail "${description} failed"
 }
 
 trim_trailing_slash() {
@@ -123,6 +174,7 @@ Usage:
   ./scripts/mailcow_s3_backup.sh --restore <mailcow-backup-directory>
   ./scripts/mailcow_s3_backup.sh --restore-domain-from-full <mailcow-backup-directory> --domain <domain> [--user <mailbox|localpart>]
   ./scripts/mailcow_s3_backup.sh --restore --domain <domain> --user <mailbox|localpart> [--backup-name <granular-backup-directory>]
+  ./scripts/mailcow_s3_backup.sh --debug ...
   ./scripts/mailcow_s3_backup.sh --help
 
 Examples:
@@ -133,6 +185,7 @@ Examples:
   ./scripts/mailcow_s3_backup.sh --restore mailcow-2026-04-07-12-00-00
   ./scripts/mailcow_s3_backup.sh --restore-domain-from-full mailcow-2026-04-07-12-00-00 --domain example.com
   ./scripts/mailcow_s3_backup.sh --restore --domain example.com --user alice
+  ./scripts/mailcow_s3_backup.sh --debug --restore-domain-from-full mailcow-2026-04-07-12-00-00 --domain example.com --user alice
 EOF
 }
 
@@ -358,9 +411,30 @@ extract_archive_to_dir() {
   local archive_file="${1:?archive_file is required}"
   local decompress_prog="${2:?decompress_prog is required}"
   local destination_dir="${3:?destination_dir is required}"
+  local log_file
 
   mkdir -p "${destination_dir}"
-  tar -C "${destination_dir}" --use-compress-program="${decompress_prog}" -xf "${archive_file}"
+
+  if [[ "${DEBUG}" == "true" ]]; then
+    tar -C "${destination_dir}" --use-compress-program="${decompress_prog}" -xf "${archive_file}"
+    return 0
+  fi
+
+  log_file="$(mktemp)"
+
+  if tar -C "${destination_dir}" --use-compress-program="${decompress_prog}" -xf "${archive_file}" >"${log_file}" 2>&1; then
+    awk '
+      /decompression does not support multi-threading/ { next }
+      /Removing leading `\/'\'' from member names/ { next }
+      { print }
+    ' "${log_file}"
+    rm -f "${log_file}"
+    return 0
+  fi
+
+  cat "${log_file}" >&2
+  rm -f "${log_file}"
+  fail "Failed to extract archive ${archive_file}"
 }
 
 load_backup_mailcow_conf() {
@@ -406,6 +480,7 @@ prepare_full_backup_stage() {
   [[ -n "${archive_info}" ]] || fail "No backup_vmail archive found in ${local_backup_dir}"
   archive_file="${archive_info%%|*}"
   decompress_prog="${archive_info#*|}"
+  log "Extracting vmail data from ${backup_name}"
   extract_archive_to_dir "${archive_file}" "${decompress_prog}" "${FULL_RESTORE_STAGE_ROOT}/extracted"
   [[ -d "${FULL_RESTORE_STAGE_ROOT}/extracted/vmail" ]] || fail "Extracted full backup is missing vmail data"
 
@@ -413,6 +488,7 @@ prepare_full_backup_stage() {
   [[ -n "${archive_info}" ]] || fail "No backup_mariadb archive found in ${local_backup_dir}"
   archive_file="${archive_info%%|*}"
   decompress_prog="${archive_info#*|}"
+  log "Extracting MariaDB data from ${backup_name}"
   extract_archive_to_dir "${archive_file}" "${decompress_prog}" "${FULL_RESTORE_STAGE_ROOT}/extracted"
   [[ -d "${FULL_RESTORE_STAGE_ROOT}/extracted/backup_mariadb" ]] || fail "Extracted full backup is missing mariadb data"
 
@@ -421,13 +497,15 @@ prepare_full_backup_stage() {
 
   sql_image="$(get_sql_image)"
 
-  docker run --rm --entrypoint= \
-    -v "${FULL_RESTORE_STAGE_ROOT}/extracted/backup_mariadb:/backup_mariadb:ro" \
-    -v "${FULL_RESTORE_TEMP_DB_DIR}:/var/lib/mysql:rw" \
-    "${sql_image}" \
-    /bin/sh -c "mariabackup --copy-back --target-dir=/backup_mariadb --datadir=/var/lib/mysql && chown -R 999:999 /var/lib/mysql" >/dev/null
+  run_quiet_command "Preparing temporary MariaDB datadir from full backup" \
+    docker run --rm --entrypoint= \
+      -v "${FULL_RESTORE_STAGE_ROOT}/extracted/backup_mariadb:/backup_mariadb:ro" \
+      -v "${FULL_RESTORE_TEMP_DB_DIR}:/var/lib/mysql:rw" \
+      "${sql_image}" \
+      /bin/sh -c "mariabackup --copy-back --target-dir=/backup_mariadb --datadir=/var/lib/mysql && chown -R 999:999 /var/lib/mysql"
 
   FULL_RESTORE_TEMP_DB_CONTAINER="mailcow-full-restore-${RANDOM}-$$"
+  log "Starting temporary MariaDB from staged full backup"
   docker run -d --rm \
     --name "${FULL_RESTORE_TEMP_DB_CONTAINER}" \
     -v "${FULL_RESTORE_TEMP_DB_DIR}:/var/lib/mysql:rw" \
@@ -660,8 +738,14 @@ restore_user_sogo() {
 resync_mailbox() {
   local mailbox_user="${1:?mailbox_user is required}"
 
-  docker exec "${DOVECOT_CONTAINER_ID}" doveadm force-resync -u "${mailbox_user}" '*' >/dev/null
-  docker exec "${DOVECOT_CONTAINER_ID}" doveadm quota recalc -u "${mailbox_user}" >/dev/null
+  run_filtered_command \
+    "Reindexing mailbox ${mailbox_user}" \
+    'UIDVALIDITY changed' \
+    docker exec "${DOVECOT_CONTAINER_ID}" doveadm force-resync -u "${mailbox_user}" '*'
+
+  run_quiet_command \
+    "Recalculating quota for ${mailbox_user}" \
+    docker exec "${DOVECOT_CONTAINER_ID}" doveadm quota recalc -u "${mailbox_user}"
 }
 
 run_backup() {
@@ -1095,6 +1179,10 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       usage
       exit 0
+      ;;
+    --debug)
+      DEBUG="true"
+      shift
       ;;
     *)
       fail "Unknown argument: $1"
