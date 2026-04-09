@@ -1,6 +1,6 @@
 # mailcow-s3-backup
 
-Wrapper around the official Mailcow backup script that uploads the generated backup set to an S3-compatible object store through `rclone`.
+Backup and restore companion for the official [mailcow-dockerized](https://github.com/mailcow/mailcow-dockerized) project, with S3 uploads, full disaster recovery, and selective restore workflows.
 
 ## What It Does
 
@@ -8,6 +8,11 @@ This project supports two backup modes:
 
 - Full backup: runs Mailcow's official `backup_and_restore.sh` and uploads the generated `mailcow-<timestamp>` directory.
 - Granular domain backup: exports a custom package for one domain, including mailbox metadata, maildirs, sieve filters, and SOGo user data for the users in that domain.
+
+It also supports two restore styles:
+
+- Native full restore: delegates to Mailcow's `backup_and_restore.sh restore`.
+- Selective restore: restores one domain or one mailbox either from a granular domain backup or directly from a full backup.
 
 ## Requirements
 
@@ -38,6 +43,9 @@ This project supports two backup modes:
 # Restore one mailbox from a full backup
 ./scripts/mailcow_s3_backup.sh --restore-domain-from-full mailcow-2026-04-07-12-00-00 --domain example.com --user alice
 
+# Same restore with verbose internals enabled
+./scripts/mailcow_s3_backup.sh --debug --restore-domain-from-full mailcow-2026-04-07-12-00-00 --domain example.com --user alice
+
 # Granular domain backup
 ./scripts/mailcow_s3_backup.sh --backup --domain example.com
 
@@ -61,6 +69,16 @@ The script automatically loads `.env` from the project root when present.
 - `RCLONE_FLAGS`: Optional extra flags passed to `rclone copy`
 - `DELETE_LOCAL_AFTER_UPLOAD`: Remove the local backup after a successful upload. Default: `true`
 - `LOCAL_RETENTION_DAYS`: Optional local retention for older `mailcow-*` directories
+
+## Debug Output
+
+By default, the script keeps the output concise and hides known low-signal noise from archive extraction, temporary MariaDB staging, and mailbox reindexing.
+
+Use `--debug` to print the full verbose output of those internal steps:
+
+```bash
+./scripts/mailcow_s3_backup.sh --debug --restore-domain-from-full mailcow-2026-04-09-09-06-58 --domain example.com --user alice
+```
 
 ## Notes
 
@@ -147,6 +165,7 @@ Important:
 - Mailbox restore from full backup reimports SOGo data from the SQL snapshot contained in the full backup.
 - The script requires enough free local disk space for temporary extraction of `backup_vmail` and `backup_mariadb`.
 - The temporary staging directory is cleaned up automatically at the end of the run.
+- Add `--debug` if you want the raw extraction, MariaDB staging, and reindex output for troubleshooting.
 
 ## Granular Domain Backup
 
