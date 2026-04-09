@@ -141,6 +141,15 @@ build_remote_target() {
   printf '%s:%s' "${RCLONE_REMOTE}" "${remote_path}"
 }
 
+list_remote_backup_dirs() {
+  local remote_target="${1:?remote_target is required}"
+
+  rclone lsf -R "${remote_target}" 2>/dev/null \
+    | awk -F/ 'NF > 1 { print $1 }' \
+    | sed '/^$/d' \
+    | sort -u
+}
+
 delete_old_local_backups() {
   local retention_days="${1:-}"
 
@@ -328,7 +337,7 @@ find_latest_remote_granular_backup_name() {
   prefix="$(granular_backup_prefix "${domain}")"
   remote_target="$(build_remote_target "granular")"
 
-  rclone lsf --dirs "${remote_target}" 2>/dev/null | sed 's#/$##' | grep "^${prefix}" | sort | tail -n 1 || true
+  list_remote_backup_dirs "${remote_target}" | grep "^${prefix}" | sort | tail -n 1 || true
 }
 
 download_granular_backup_if_needed() {
@@ -653,7 +662,7 @@ run_full_list() {
   local entries
 
   remote_target="$(build_remote_target "")"
-  entries="$(rclone lsf --dirs "${remote_target}" 2>/dev/null | sed 's#/$##' | grep '^mailcow-' | grep -v '^mailcow-domain-' || true)"
+  entries="$(list_remote_backup_dirs "${remote_target}" | grep '^mailcow-' | grep -v '^mailcow-domain-' || true)"
 
   [[ -n "${entries}" ]] || fail "No full backups found in ${remote_target}"
 
@@ -669,7 +678,7 @@ run_granular_list() {
 
   remote_target="$(build_remote_target "granular")"
   prefix="$(granular_backup_prefix "${domain}")"
-  entries="$(rclone lsf --dirs "${remote_target}" 2>/dev/null | sed 's#/$##' | grep "^${prefix}" || true)"
+  entries="$(list_remote_backup_dirs "${remote_target}" | grep "^${prefix}" || true)"
 
   [[ -n "${entries}" ]] || fail "No granular backups found for domain ${domain}"
 
