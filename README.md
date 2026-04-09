@@ -32,6 +32,12 @@ This project supports two backup modes:
 # Full restore
 ./scripts/mailcow_s3_backup.sh --restore mailcow-2026-04-07-12-00-00
 
+# Restore one domain from a full backup
+./scripts/mailcow_s3_backup.sh --restore-domain-from-full mailcow-2026-04-07-12-00-00 --domain example.com
+
+# Restore one mailbox from a full backup
+./scripts/mailcow_s3_backup.sh --restore-domain-from-full mailcow-2026-04-07-12-00-00 --domain example.com --user alice
+
 # Granular domain backup
 ./scripts/mailcow_s3_backup.sh --backup --domain example.com
 
@@ -106,6 +112,41 @@ Important:
 For the official Mailcow restore behavior and prerequisites, see:
 - https://docs.mailcow.email/backup_restore/b_n_r-backup/
 - https://docs.mailcow.email/de/backup_restore/b_n_r-restore/
+
+## Selective Restore From Full Backup
+
+Use `--restore-domain-from-full <mailcow-backup-directory> --domain <domain>` to extract one domain from a full Mailcow backup without running a full instance-wide restore. If `--user` is also passed, only that mailbox is restored.
+
+Examples:
+
+```bash
+# Restore all mailboxes of one domain from a full backup
+./scripts/mailcow_s3_backup.sh \
+  --restore-domain-from-full mailcow-2026-04-09-09-06-58 \
+  --domain example.com
+
+# Restore a single mailbox from a full backup
+./scripts/mailcow_s3_backup.sh \
+  --restore-domain-from-full mailcow-2026-04-09-09-06-58 \
+  --domain example.com \
+  --user alice
+```
+
+How it works:
+
+- The script downloads the selected full backup if it is not already present locally.
+- It extracts `backup_vmail` and `backup_mariadb` into a temporary staging area.
+- It starts a temporary MariaDB container from the extracted full backup.
+- It builds a temporary domain-scoped restore package from that staged data.
+- It imports the selected domain and mailbox data into the current Mailcow instance and runs `doveadm force-resync` and `doveadm quota recalc`.
+
+Important:
+
+- This flow is separate from Mailcow's native `backup_and_restore.sh restore`.
+- Domain restore from full backup currently restores the selected domain's metadata and mailboxes, but does not delete unrelated mailboxes already present on the target system.
+- Mailbox restore from full backup reimports SOGo data from the SQL snapshot contained in the full backup.
+- The script requires enough free local disk space for temporary extraction of `backup_vmail` and `backup_mariadb`.
+- The temporary staging directory is cleaned up automatically at the end of the run.
 
 ## Granular Domain Backup
 

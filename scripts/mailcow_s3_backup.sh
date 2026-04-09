@@ -13,6 +13,13 @@ DOVECOT_CONTAINER_ID=""
 SOGO_CONTAINER_ID=""
 VMAIL_VOLUME_MOUNTPOINT=""
 SOGO_CONFIG_DIR=""
+SQL_IMAGE=""
+SOURCE_DBROOT=""
+SOURCE_DBNAME=""
+FULL_RESTORE_STAGE_ROOT=""
+FULL_RESTORE_TEMP_DB_DIR=""
+FULL_RESTORE_TEMP_DB_CONTAINER=""
+DEBUG="${DEBUG:-false}"
 
 load_env_file() {
   local env_file="${1:-}"
@@ -34,8 +41,72 @@ fail() {
   exit 1
 }
 
+cleanup_temp_resources() {
+  if [[ -n "${FULL_RESTORE_TEMP_DB_CONTAINER}" ]]; then
+    docker rm -f "${FULL_RESTORE_TEMP_DB_CONTAINER}" >/dev/null 2>&1 || true
+    FULL_RESTORE_TEMP_DB_CONTAINER=""
+  fi
+
+  if [[ -n "${FULL_RESTORE_STAGE_ROOT}" && -d "${FULL_RESTORE_STAGE_ROOT}" ]]; then
+    rm -rf "${FULL_RESTORE_STAGE_ROOT}" >/dev/null 2>&1 || true
+    FULL_RESTORE_STAGE_ROOT=""
+  fi
+}
+
+trap cleanup_temp_resources EXIT
+
 require_bin() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required binary: $1"
+}
+
+run_quiet_command() {
+  local description="${1:?description is required}"
+  shift
+  local log_file
+
+  log "${description}"
+
+  if [[ "${DEBUG}" == "true" ]]; then
+    "$@"
+    return 0
+  fi
+
+  log_file="$(mktemp)"
+
+  if "$@" >"${log_file}" 2>&1; then
+    rm -f "${log_file}"
+    return 0
+  fi
+
+  cat "${log_file}" >&2
+  rm -f "${log_file}"
+  fail "${description} failed"
+}
+
+run_filtered_command() {
+  local description="${1:?description is required}"
+  local filter_pattern="${2:?filter_pattern is required}"
+  shift 2
+  local log_file
+
+  log "${description}"
+
+  if [[ "${DEBUG}" == "true" ]]; then
+    "$@"
+    return 0
+  fi
+
+  log_file="$(mktemp)"
+
+  if "$@" >"${log_file}" 2>&1; then
+    grep -Ev "${filter_pattern}" "${log_file}" || true
+    rm -f "${log_file}"
+    return 0
+  fi
+
+  cat "${log_file}" >&2
+  rm -f "${log_file}"
+  fail "${description} failed"
 }
 
 trim_trailing_slash() {
@@ -101,7 +172,9 @@ Usage:
   ./scripts/mailcow_s3_backup.sh --list
   ./scripts/mailcow_s3_backup.sh --list --domain <domain>
   ./scripts/mailcow_s3_backup.sh --restore <mailcow-backup-directory>
+  ./scripts/mailcow_s3_backup.sh --restore-domain-from-full <mailcow-backup-directory> --domain <domain> [--user <mailbox|localpart>]
   ./scripts/mailcow_s3_backup.sh --restore --domain <domain> --user <mailbox|localpart> [--backup-name <granular-backup-directory>]
+  ./scripts/mailcow_s3_backup.sh --debug ...
   ./scripts/mailcow_s3_backup.sh --help
 
 Examples:
@@ -110,7 +183,9 @@ Examples:
   ./scripts/mailcow_s3_backup.sh --list
   ./scripts/mailcow_s3_backup.sh --list --domain example.com
   ./scripts/mailcow_s3_backup.sh --restore mailcow-2026-04-07-12-00-00
+  ./scripts/mailcow_s3_backup.sh --restore-domain-from-full mailcow-2026-04-07-12-00-00 --domain example.com
   ./scripts/mailcow_s3_backup.sh --restore --domain example.com --user alice
+  ./scripts/mailcow_s3_backup.sh --debug --restore-domain-from-full mailcow-2026-04-07-12-00-00 --domain example.com --user alice
 EOF
 }
 
@@ -213,6 +288,17 @@ load_mailcow_runtime() {
   [[ -d "${SOGO_CONFIG_DIR}" ]] || fail "SOGo config directory not found: ${SOGO_CONFIG_DIR}"
 }
 
+get_sql_image() {
+  load_mailcow_conf
+
+  if [[ -z "${SQL_IMAGE}" ]]; then
+    SQL_IMAGE="$(grep -iEo '(mysql|mariadb)\:.+' "${MAILCOW_PROJECT_DIR}/docker-compose.yml" | head -n 1)"
+  fi
+
+  [[ -n "${SQL_IMAGE}" ]] || fail "Could not determine SQL image from docker-compose.yml"
+  printf '%s' "${SQL_IMAGE}"
+}
+
 mysql_query() {
   local sql="${1:?sql is required}"
 
@@ -240,6 +326,192 @@ table_exists() {
 
   escaped_table="$(sql_escape "${table}")"
   [[ -n "$(mysql_query "SHOW TABLES LIKE '${escaped_table}';")" ]]
+}
+
+source_mysql_query() {
+  local sql="${1:?sql is required}"
+
+  docker exec "${FULL_RESTORE_TEMP_DB_CONTAINER}" mariadb -N -uroot "-p${SOURCE_DBROOT}" "${SOURCE_DBNAME}" -e "${sql}"
+}
+
+source_table_exists() {
+  local table="${1:?table is required}"
+  local escaped_table
+
+  escaped_table="$(sql_escape "${table}")"
+  [[ -n "$(source_mysql_query "SHOW TABLES LIKE '${escaped_table}';")" ]]
+}
+
+append_source_table_dump() {
+  local table="${1:?table is required}"
+  local where_clause="${2:?where_clause is required}"
+  local output_file="${3:?output_file is required}"
+  local count
+
+  source_table_exists "${table}" || return 0
+
+  count="$(source_mysql_query "SELECT COUNT(*) FROM \`${table}\` WHERE ${where_clause};" | tr -d '[:space:]')"
+  [[ "${count:-0}" =~ ^[0-9]+$ ]] || fail "Could not count source rows in table ${table}"
+  [[ "${count}" -gt 0 ]] || return 0
+
+  docker exec "${FULL_RESTORE_TEMP_DB_CONTAINER}" mariadb-dump \
+    -uroot "-p${SOURCE_DBROOT}" "${SOURCE_DBNAME}" \
+    --no-create-info \
+    --skip-triggers \
+    --complete-insert \
+    --replace \
+    --skip-comments \
+    "${table}" \
+    "--where=${where_clause}" >> "${output_file}"
+
+  printf '\n' >> "${output_file}"
+}
+
+get_archive_info() {
+  local backup_name="${1:?backup_name is required}"
+  local location="${2:?location is required}"
+
+  if [[ -f "${location}/${backup_name}.tar.zst" ]]; then
+    printf '%s|%s\n' "${location}/${backup_name}.tar.zst" "zstd -d -T${THREADS}"
+  elif [[ -f "${location}/${backup_name}.tar.gz" ]]; then
+    printf '%s|%s\n' "${location}/${backup_name}.tar.gz" "pigz -d -p ${THREADS}"
+  else
+    printf '\n'
+  fi
+}
+
+ensure_full_backup_available() {
+  local backup_name="${1:?backup_name is required}"
+  local remote_target
+  local local_restore_dir
+
+  [[ "${backup_name}" != */* ]] || fail "Backup name must be a single directory name, not a path"
+
+  remote_target="$(build_remote_target "${backup_name}")"
+  local_restore_dir="${MAILCOW_BACKUP_LOCATION}/${backup_name}"
+
+  if [[ -d "${local_restore_dir}" ]]; then
+    printf '%s' "${local_restore_dir}"
+    return 0
+  fi
+
+  if [[ -e "${local_restore_dir}" ]]; then
+    fail "Local restore path exists but is not a directory: ${local_restore_dir}"
+  fi
+
+  log "Downloading ${backup_name} from ${remote_target} to ${local_restore_dir}"
+  build_rclone_copy_args "${remote_target}" "${local_restore_dir}"
+  rclone "${RCLONE_ARGS[@]}"
+
+  [[ -d "${local_restore_dir}" ]] || fail "Restore download did not create ${local_restore_dir}"
+  printf '%s' "${local_restore_dir}"
+}
+
+extract_archive_to_dir() {
+  local archive_file="${1:?archive_file is required}"
+  local decompress_prog="${2:?decompress_prog is required}"
+  local destination_dir="${3:?destination_dir is required}"
+  local log_file
+
+  mkdir -p "${destination_dir}"
+
+  if [[ "${DEBUG}" == "true" ]]; then
+    tar -C "${destination_dir}" --use-compress-program="${decompress_prog}" -xf "${archive_file}"
+    return 0
+  fi
+
+  log_file="$(mktemp)"
+
+  if tar -C "${destination_dir}" --use-compress-program="${decompress_prog}" -xf "${archive_file}" >"${log_file}" 2>&1; then
+    awk '
+      /decompression does not support multi-threading/ { next }
+      /Removing leading `\/'\'' from member names/ { next }
+      { print }
+    ' "${log_file}"
+    rm -f "${log_file}"
+    return 0
+  fi
+
+  cat "${log_file}" >&2
+  rm -f "${log_file}"
+  fail "Failed to extract archive ${archive_file}"
+}
+
+load_backup_mailcow_conf() {
+  local backup_dir="${1:?backup_dir is required}"
+  local backup_conf="${backup_dir}/mailcow.conf"
+
+  [[ -f "${backup_conf}" ]] || fail "mailcow.conf not found in full backup: ${backup_conf}"
+
+  SOURCE_DBROOT="$(source "${backup_conf}" >/dev/null 2>&1; printf '%s' "${DBROOT:-}")"
+  SOURCE_DBNAME="$(source "${backup_conf}" >/dev/null 2>&1; printf '%s' "${DBNAME:-mailcow}")"
+
+  [[ -n "${SOURCE_DBROOT}" ]] || fail "DBROOT not found in backup mailcow.conf"
+  [[ -n "${SOURCE_DBNAME}" ]] || fail "DBNAME not found in backup mailcow.conf"
+}
+
+wait_for_source_db() {
+  local tries=0
+
+  until docker exec "${FULL_RESTORE_TEMP_DB_CONTAINER}" mariadb -N -uroot "-p${SOURCE_DBROOT}" "${SOURCE_DBNAME}" -e "SELECT 1;" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [[ "${tries}" -lt 60 ]] || fail "Temporary MariaDB from full backup did not become ready"
+    sleep 1
+  done
+}
+
+prepare_full_backup_stage() {
+  local backup_name="${1:?backup_name is required}"
+  local local_backup_dir
+  local archive_info
+  local archive_file
+  local decompress_prog
+  local sql_image
+
+  cleanup_temp_resources
+  load_mailcow_runtime
+
+  local_backup_dir="$(ensure_full_backup_available "${backup_name}")"
+  load_backup_mailcow_conf "${local_backup_dir}"
+
+  FULL_RESTORE_STAGE_ROOT="$(mktemp -d "${MAILCOW_BACKUP_LOCATION}/restore-from-full-${backup_name}.XXXXXX")"
+
+  archive_info="$(get_archive_info "backup_vmail" "${local_backup_dir}")"
+  [[ -n "${archive_info}" ]] || fail "No backup_vmail archive found in ${local_backup_dir}"
+  archive_file="${archive_info%%|*}"
+  decompress_prog="${archive_info#*|}"
+  log "Extracting vmail data from ${backup_name}"
+  extract_archive_to_dir "${archive_file}" "${decompress_prog}" "${FULL_RESTORE_STAGE_ROOT}/extracted"
+  [[ -d "${FULL_RESTORE_STAGE_ROOT}/extracted/vmail" ]] || fail "Extracted full backup is missing vmail data"
+
+  archive_info="$(get_archive_info "backup_mariadb" "${local_backup_dir}")"
+  [[ -n "${archive_info}" ]] || fail "No backup_mariadb archive found in ${local_backup_dir}"
+  archive_file="${archive_info%%|*}"
+  decompress_prog="${archive_info#*|}"
+  log "Extracting MariaDB data from ${backup_name}"
+  extract_archive_to_dir "${archive_file}" "${decompress_prog}" "${FULL_RESTORE_STAGE_ROOT}/extracted"
+  [[ -d "${FULL_RESTORE_STAGE_ROOT}/extracted/backup_mariadb" ]] || fail "Extracted full backup is missing mariadb data"
+
+  FULL_RESTORE_TEMP_DB_DIR="${FULL_RESTORE_STAGE_ROOT}/mysql-datadir"
+  mkdir -p "${FULL_RESTORE_TEMP_DB_DIR}"
+
+  sql_image="$(get_sql_image)"
+
+  run_quiet_command "Preparing temporary MariaDB datadir from full backup" \
+    docker run --rm --entrypoint= \
+      -v "${FULL_RESTORE_STAGE_ROOT}/extracted/backup_mariadb:/backup_mariadb:ro" \
+      -v "${FULL_RESTORE_TEMP_DB_DIR}:/var/lib/mysql:rw" \
+      "${sql_image}" \
+      /bin/sh -c "mariabackup --copy-back --target-dir=/backup_mariadb --datadir=/var/lib/mysql && chown -R 999:999 /var/lib/mysql"
+
+  FULL_RESTORE_TEMP_DB_CONTAINER="mailcow-full-restore-${RANDOM}-$$"
+  log "Starting temporary MariaDB from staged full backup"
+  docker run -d --rm \
+    --name "${FULL_RESTORE_TEMP_DB_CONTAINER}" \
+    -v "${FULL_RESTORE_TEMP_DB_DIR}:/var/lib/mysql:rw" \
+    "${sql_image}" >/dev/null
+
+  wait_for_source_db
 }
 
 append_table_dump() {
@@ -386,10 +658,17 @@ cleanup_user_metadata() {
   delete_rows_if_table_exists "fido2" "\`username\` = '${escaped_user}'"
   delete_rows_if_table_exists "app_passwd" "\`mailbox\` = '${escaped_user}'"
   delete_rows_if_table_exists "sieve_filters" "\`username\` = '${escaped_user}'"
+  delete_rows_if_table_exists "sogo_user_profile" "\`c_uid\` = '${escaped_user}'"
+  delete_rows_if_table_exists "sogo_cache_folder" "\`c_uid\` = '${escaped_user}'"
+  delete_rows_if_table_exists "sogo_acl" "\`c_uid\` = '${escaped_user}' OR \`c_object\` LIKE '%/${escaped_user}/%'"
+  delete_rows_if_table_exists "sogo_store" "\`c_folder_id\` IN (SELECT \`c_folder_id\` FROM \`sogo_folder_info\` WHERE \`c_path2\` = '${escaped_user}')"
+  delete_rows_if_table_exists "sogo_quick_contact" "\`c_folder_id\` IN (SELECT \`c_folder_id\` FROM \`sogo_folder_info\` WHERE \`c_path2\` = '${escaped_user}')"
+  delete_rows_if_table_exists "sogo_quick_appointment" "\`c_folder_id\` IN (SELECT \`c_folder_id\` FROM \`sogo_folder_info\` WHERE \`c_path2\` = '${escaped_user}')"
+  delete_rows_if_table_exists "sogo_folder_info" "\`c_path2\` = '${escaped_user}'"
 }
 
-restore_user_maildir() {
-  local backup_dir="${1:?backup_dir is required}"
+restore_user_maildir_from_root() {
+  local source_root="${1:?source_root is required}"
   local domain="${2:?domain is required}"
   local mailbox_user="${3:?mailbox_user is required}"
   local local_part
@@ -397,7 +676,7 @@ restore_user_maildir() {
   local target_maildir
 
   local_part="${mailbox_user%@*}"
-  source_maildir="${backup_dir}/maildir/${domain}/${local_part}"
+  source_maildir="${source_root}/${domain}/${local_part}"
   target_maildir="${VMAIL_VOLUME_MOUNTPOINT}/${domain}/${local_part}"
 
   [[ -d "${source_maildir}" ]] || return 0
@@ -409,8 +688,16 @@ restore_user_maildir() {
   docker exec "${DOVECOT_CONTAINER_ID}" chown -R vmail:vmail "/var/vmail/${domain}/${local_part}" >/dev/null
 }
 
-restore_user_sieve() {
+restore_user_maildir() {
   local backup_dir="${1:?backup_dir is required}"
+  local domain="${2:?domain is required}"
+  local mailbox_user="${3:?mailbox_user is required}"
+
+  restore_user_maildir_from_root "${backup_dir}/maildir" "${domain}" "${mailbox_user}"
+}
+
+restore_user_sieve_from_root() {
+  local source_root="${1:?source_root is required}"
   local mailbox_user="${2:?mailbox_user is required}"
   local sieve_dir="${VMAIL_VOLUME_MOUNTPOINT}/sieve"
   local source_path
@@ -418,14 +705,21 @@ restore_user_sieve() {
   mkdir -p "${sieve_dir}"
 
   for source_path in \
-    "${backup_dir}/sieve/${mailbox_user}.sieve" \
-    "${backup_dir}/sieve/${mailbox_user}.svbin"
+    "${source_root}/${mailbox_user}.sieve" \
+    "${source_root}/${mailbox_user}.svbin"
   do
     [[ -e "${source_path}" ]] || continue
     cp -a "${source_path}" "${sieve_dir}/"
   done
 
   docker exec "${DOVECOT_CONTAINER_ID}" sh -lc "chown -R vmail:vmail /var/vmail/sieve >/dev/null 2>&1 || true"
+}
+
+restore_user_sieve() {
+  local backup_dir="${1:?backup_dir is required}"
+  local mailbox_user="${2:?mailbox_user is required}"
+
+  restore_user_sieve_from_root "${backup_dir}/sieve" "${mailbox_user}"
 }
 
 restore_user_sogo() {
@@ -444,8 +738,14 @@ restore_user_sogo() {
 resync_mailbox() {
   local mailbox_user="${1:?mailbox_user is required}"
 
-  docker exec "${DOVECOT_CONTAINER_ID}" doveadm force-resync -u "${mailbox_user}" '*' >/dev/null
-  docker exec "${DOVECOT_CONTAINER_ID}" doveadm quota recalc -u "${mailbox_user}" >/dev/null
+  run_filtered_command \
+    "Reindexing mailbox ${mailbox_user}" \
+    'UIDVALIDITY changed' \
+    docker exec "${DOVECOT_CONTAINER_ID}" doveadm force-resync -u "${mailbox_user}" '*'
+
+  run_quiet_command \
+    "Recalculating quota for ${mailbox_user}" \
+    docker exec "${DOVECOT_CONTAINER_ID}" doveadm quota recalc -u "${mailbox_user}"
 }
 
 run_backup() {
@@ -581,6 +881,134 @@ run_domain_backup() {
   log "Granular domain backup completed successfully"
 }
 
+build_domain_package_from_full_backup() {
+  local domain="${1:?domain is required}"
+  local package_dir="${2:?package_dir is required}"
+  local specific_mailbox_user="${3:-}"
+  local escaped_domain
+  local metadata_dir
+  local users_sql_dir
+  local domain_sql_file
+  local mailbox_user
+  local escaped_user
+  local local_part
+  local maildir_source
+  local -a source_users=()
+
+  escaped_domain="$(sql_escape "${domain}")"
+  metadata_dir="${package_dir}/metadata"
+  users_sql_dir="${metadata_dir}/users"
+  domain_sql_file="${metadata_dir}/domain.sql"
+
+  mkdir -p "${users_sql_dir}" "${package_dir}/maildir/${domain}" "${package_dir}/sieve"
+  : > "${domain_sql_file}"
+
+  append_source_table_dump "domain" "\`domain\` = '${escaped_domain}'" "${domain_sql_file}"
+  append_source_table_dump "domain_admins" "\`domain\` = '${escaped_domain}'" "${domain_sql_file}"
+  append_source_table_dump "alias_domain" "\`target_domain\` = '${escaped_domain}' OR \`alias_domain\` = '${escaped_domain}'" "${domain_sql_file}"
+  append_source_table_dump "alias" "\`domain\` = '${escaped_domain}'" "${domain_sql_file}"
+  append_source_table_dump "filterconf" "\`object\` = '${escaped_domain}'" "${domain_sql_file}"
+  append_source_table_dump "bcc_maps" "\`local_dest\` = '${escaped_domain}' OR \`bcc_dest\` = '${escaped_domain}'" "${domain_sql_file}"
+  append_source_table_dump "mta_sts" "\`domain\` = '${escaped_domain}'" "${domain_sql_file}"
+
+  if [[ -n "${specific_mailbox_user}" ]]; then
+    source_users=( "${specific_mailbox_user}" )
+  else
+    mapfile -t source_users < <(source_mysql_query "SELECT \`username\` FROM \`mailbox\` WHERE \`domain\` = '${escaped_domain}' ORDER BY \`username\`;")
+  fi
+
+  [[ "${#source_users[@]}" -gt 0 ]] || fail "No mailboxes found for domain ${domain} in full backup"
+
+  for mailbox_user in "${source_users[@]}"; do
+    escaped_user="$(sql_escape "${mailbox_user}")"
+    local_part="${mailbox_user%@*}"
+    maildir_source="${FULL_RESTORE_STAGE_ROOT}/extracted/vmail/${domain}/${local_part}"
+    user_sql_file="${users_sql_dir}/${mailbox_user}.sql"
+
+    : > "${user_sql_file}"
+
+    append_source_table_dump "mailbox" "\`username\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "alias" "\`address\` = '${escaped_user}' OR FIND_IN_SET('${escaped_user}', REPLACE(\`goto\`, ' ', '')) > 0" "${user_sql_file}"
+    append_source_table_dump "sender_acl" "\`logged_in_as\` = '${escaped_user}' OR \`send_as\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "quota2" "\`username\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "quota2replica" "\`username\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "pushover" "\`username\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "filterconf" "\`object\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "bcc_maps" "\`local_dest\` = '${escaped_user}' OR \`bcc_dest\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "spamalias" "\`goto\` = '${escaped_user}' OR \`address\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "sieve_filters" "\`username\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "user_acl" "\`username\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "app_passwd" "\`mailbox\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "imapsync" "\`user2\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "oauth_access_tokens" "\`user_id\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "oauth_refresh_tokens" "\`user_id\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "oauth_authorization_codes" "\`user_id\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "tfa" "\`username\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "fido2" "\`username\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "sogo_user_profile" "\`c_uid\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "sogo_cache_folder" "\`c_uid\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "sogo_acl" "\`c_uid\` = '${escaped_user}' OR \`c_object\` LIKE '%/${escaped_user}/%'" "${user_sql_file}"
+    append_source_table_dump "sogo_folder_info" "\`c_path2\` = '${escaped_user}'" "${user_sql_file}"
+    append_source_table_dump "sogo_store" "\`c_folder_id\` IN (SELECT \`c_folder_id\` FROM \`sogo_folder_info\` WHERE \`c_path2\` = '${escaped_user}')" "${user_sql_file}"
+    append_source_table_dump "sogo_quick_contact" "\`c_folder_id\` IN (SELECT \`c_folder_id\` FROM \`sogo_folder_info\` WHERE \`c_path2\` = '${escaped_user}')" "${user_sql_file}"
+    append_source_table_dump "sogo_quick_appointment" "\`c_folder_id\` IN (SELECT \`c_folder_id\` FROM \`sogo_folder_info\` WHERE \`c_path2\` = '${escaped_user}')" "${user_sql_file}"
+
+    copy_path_if_exists "${maildir_source}" "${package_dir}/maildir/${domain}"
+    copy_path_if_exists "${FULL_RESTORE_STAGE_ROOT}/extracted/vmail/sieve/${mailbox_user}.sieve" "${package_dir}/sieve"
+    copy_path_if_exists "${FULL_RESTORE_STAGE_ROOT}/extracted/vmail/sieve/${mailbox_user}.svbin" "${package_dir}/sieve"
+  done
+
+  write_granular_manifest "${package_dir}/manifest.env" "$(basename "${package_dir}")" "${domain}" "${source_users[@]}"
+}
+
+run_restore_domain_from_full() {
+  local backup_name="${1:?backup_name is required}"
+  local domain="${2:?domain is required}"
+  local user_input="${3:-}"
+  local mailbox_user=""
+  local package_dir
+  local domain_sql_file
+  local user_sql_file
+  local restore_user
+  local -a restore_users=()
+
+  load_mailcow_runtime
+  prepare_full_backup_stage "${backup_name}"
+
+  if [[ -n "${user_input}" ]]; then
+    mailbox_user="$(normalize_mailbox_user "${domain}" "${user_input}")"
+  fi
+
+  package_dir="${FULL_RESTORE_STAGE_ROOT}/domain-package"
+  build_domain_package_from_full_backup "${domain}" "${package_dir}" "${mailbox_user}"
+  domain_sql_file="${package_dir}/metadata/domain.sql"
+
+  if [[ -n "${mailbox_user}" ]]; then
+    restore_users=( "${mailbox_user}" )
+  else
+    mapfile -t restore_users < <(find "${package_dir}/metadata/users" -mindepth 1 -maxdepth 1 -type f -name '*.sql' -exec basename {} .sql \; | sort)
+  fi
+
+  [[ "${#restore_users[@]}" -gt 0 ]] || fail "No users found to restore from full backup for domain ${domain}"
+
+  log "Restoring ${#restore_users[@]} mailbox(es) for domain ${domain} from full backup ${backup_name}"
+
+  mysql_import_file "${domain_sql_file}"
+
+  for restore_user in "${restore_users[@]}"; do
+    user_sql_file="${package_dir}/metadata/users/${restore_user}.sql"
+    [[ -f "${user_sql_file}" ]] || fail "Missing user SQL for ${restore_user} in staged full backup package"
+
+    cleanup_user_metadata "${restore_user}"
+    mysql_import_file "${user_sql_file}"
+    restore_user_maildir_from_root "${package_dir}/maildir" "${domain}" "${restore_user}"
+    restore_user_sieve_from_root "${package_dir}/sieve" "${restore_user}"
+    resync_mailbox "${restore_user}"
+  done
+
+  log "Restore from full backup completed successfully for domain ${domain}"
+}
+
 run_full_restore() {
   local restore_name="${1:-}"
   local remote_target
@@ -711,6 +1139,13 @@ while [[ $# -gt 0 ]]; do
       OPERATION="backup"
       shift
       ;;
+    --restore-domain-from-full)
+      OPERATION="restore_from_full"
+      shift
+      [[ $# -gt 0 && "$1" != --* ]] || fail "--restore-domain-from-full requires a full backup directory name"
+      FULL_RESTORE_NAME="$1"
+      shift
+      ;;
     --restore)
       OPERATION="restore"
       shift
@@ -744,6 +1179,10 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       usage
       exit 0
+      ;;
+    --debug)
+      DEBUG="true"
+      shift
       ;;
     *)
       fail "Unknown argument: $1"
@@ -800,6 +1239,11 @@ case "${OPERATION}" in
       [[ -z "${GRANULAR_BACKUP_NAME}" ]] || fail "--backup-name requires --domain"
       run_full_restore "${FULL_RESTORE_NAME}"
     fi
+    ;;
+  restore_from_full)
+    [[ -n "${DOMAIN_NAME}" ]] || fail "--restore-domain-from-full requires --domain"
+    [[ -z "${GRANULAR_BACKUP_NAME}" ]] || fail "--backup-name is not supported with --restore-domain-from-full"
+    run_restore_domain_from_full "${FULL_RESTORE_NAME}" "${DOMAIN_NAME}" "${USER_NAME}"
     ;;
   *)
     fail "Unsupported operation: ${OPERATION}"
